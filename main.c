@@ -18,7 +18,14 @@
 #define MAX_DLUGOSC (GRID_W * GRID_H)
 
 // ===== SIEĆ =====
-#define WEJSCIA 11
+// 0-2   niebezpieczenstwo (przod, prawo, lewo)
+// 3-6   kierunek one-hot
+// 7-8   pozycja jablka (0..1)
+// 9-10  pozycja glowy (0..1)
+// 11-12 wektor glowa -> jablko w swiecie (-1..1)
+// 13-14 jablko wzgledem glowy: przod / prawo (-1..1)
+// 15-17 jablko z przodu / po prawej / po lewej (0/1)
+#define WEJSCIA 18
 #define UKRYTA1 128
 #define UKRYTA2 128
 #define WYJSCIA 3
@@ -26,9 +33,16 @@
 #define GAMMA 0.95f
 #define BATCH 64
 #define REPLAY 50000
+#define MIN_REPLAY 1000        // start nauki dopiero po zebraniu tylu probek
+#define UCZ_CO 2               // jedna aktualizacja sieci co tyle krokow gry
 #define TARGET_SYNC 500
-#define EPIZODY_TRENINGU 300
-#define MAX_WATKOW 32
+#define EPIZODY_TRENINGU 1000
+#define MAX_WATKOW 4           // mala siec - wiecej watkow nie przyspiesza
+
+// ===== NAGRODY (male wartosci pasuja do Adama i Hubera) =====
+#define NAGRODA_JABLKO  1.0f
+#define NAGRODA_SMIERC -1.0f
+#define NAGRODA_KROK   -0.01f
 
 // ===== TYPY =====
 typedef struct { int x, y; } Punkt;
@@ -100,6 +114,7 @@ static float akumulatorRuchu = 0.0f;
 static Siec siec;
 static Siec siecTarget;
 static Adam adam;
+static float adamBc1 = 1.0f, adamBc2 = 1.0f;   // korekcja biasu liczona raz na batch
 
 static Doswiadczenie replay[REPLAY];
 static int replayIdx = 0;
@@ -247,20 +262,23 @@ static int dlugoscText(const char *s, int skala) {
 }
 
 // ===== SIEĆ =====
+// inicjalizacja He (rozklad rownomierny): limit = sqrt(6 / n_wejsc)
+static float losujWage(int nWej) {
+    float u = (float)rand() / (float)RAND_MAX * 2.0f - 1.0f;
+    return u * sqrtf(6.0f / (float)nWej);
+}
+
 static void inicjujSiec(Siec *s) {
     for (int i = 0; i < UKRYTA1; i++) {
-        for (int j = 0; j < WEJSCIA; j++)
-            s->W1[i][j] = ((float)rand()/RAND_MAX - 0.5f) * sqrtf(2.0f / WEJSCIA);
+        for (int j = 0; j < WEJSCIA; j++) s->W1[i][j] = losujWage(WEJSCIA);
         s->b1[i] = 0.0f;
     }
     for (int i = 0; i < UKRYTA2; i++) {
-        for (int j = 0; j < UKRYTA1; j++)
-            s->W2[i][j] = ((float)rand()/RAND_MAX - 0.5f) * sqrtf(2.0f / UKRYTA1);
+        for (int j = 0; j < UKRYTA1; j++) s->W2[i][j] = losujWage(UKRYTA1);
         s->b2[i] = 0.0f;
     }
     for (int i = 0; i < WYJSCIA; i++) {
-        for (int j = 0; j < UKRYTA2; j++)
-            s->W3[i][j] = ((float)rand()/RAND_MAX - 0.5f) * sqrtf(2.0f / UKRYTA2);
+        for (int j = 0; j < UKRYTA2; j++) s->W3[i][j] = losujWage(UKRYTA2) * 0.1f;
         s->b3[i] = 0.0f;
     }
 }
@@ -361,12 +379,13 @@ static DWORD WINAPI watekRoboczy(LPVOID arg) {
 }
 
 // ===== ADAM =====
-static void adamUpdate(float *param, float *grad, float *m, float *v, float lr) {
+// adamBc1 / adamBc2 = (1 - beta^t), liczone raz na batch (bez powf przy kazdym parametrze)
+static inline void adamUpdate(float *param, float grad, float *m, float *v, float lr) {
     const float beta1 = 0.9f, beta2 = 0.999f, eps = 1e-8f;
-    *m = beta1 * (*m) + (1 - beta1) * (*grad);
-    *v = beta2 * (*v) + (1 - beta2) * (*grad) * (*grad);
-    float mHat = *m / (1.0f - powf(beta1, (float)adam.t));
-    float vHat = *v / (1.0f - powf(beta2, (float)adam.t));
+    *m = beta1 * (*m) + (1.0f - beta1) * grad;
+    *v = beta2 * (*v) + (1.0f - beta2) * grad * grad;
+    float mHat = *m / adamBc1;
+    float vHat = *v / adamBc2;
     *param -= lr * mHat / (sqrtf(vHat) + eps);
 }
 
@@ -380,6 +399,8 @@ static void trenujBatchRownolegle(void) {
         batchPtr[i] = &replay[idx];
     }
     adam.t++;
+    adamBc1 = 1.0f - powf(0.9f,   (float)adam.t);
+    adamBc2 = 1.0f - powf(0.999f, (float)adam.t);
 
     InterlockedExchange(&indeksNastepny, 0);
     batchRozmiar = BATCH;
@@ -390,46 +411,34 @@ static void trenujBatchRownolegle(void) {
 
     float inv = 1.0f / BATCH;
     for (int i = 0; i < UKRYTA1; i++) {
-        float accW[WEJSCIA];
         for (int j = 0; j < WEJSCIA; j++) {
-            accW[j] = 0;
-            for (int w = 0; w < liczbaWatkow; w++) accW[j] += gradientyWatkow[w].gW1[i][j];
+            float acc = 0.0f;
+            for (int w = 0; w < liczbaWatkow; w++) acc += gradientyWatkow[w].gW1[i][j];
+            adamUpdate(&siec.W1[i][j], acc * inv, &adam.mW1[i][j], &adam.vW1[i][j], LR);
         }
-        float accB = 0;
+        float accB = 0.0f;
         for (int w = 0; w < liczbaWatkow; w++) accB += gradientyWatkow[w].gb1[i];
-        for (int j = 0; j < WEJSCIA; j++)
-            adamUpdate(&siec.W1[i][j], &(float){accW[j] * inv},
-                       &adam.mW1[i][j], &adam.vW1[i][j], LR);
-        adamUpdate(&siec.b1[i], &(float){accB * inv},
-                   &adam.mb1[i], &adam.vb1[i], LR);
+        adamUpdate(&siec.b1[i], accB * inv, &adam.mb1[i], &adam.vb1[i], LR);
     }
     for (int i = 0; i < UKRYTA2; i++) {
-        float accW[UKRYTA1];
         for (int j = 0; j < UKRYTA1; j++) {
-            accW[j] = 0;
-            for (int w = 0; w < liczbaWatkow; w++) accW[j] += gradientyWatkow[w].gW2[i][j];
+            float acc = 0.0f;
+            for (int w = 0; w < liczbaWatkow; w++) acc += gradientyWatkow[w].gW2[i][j];
+            adamUpdate(&siec.W2[i][j], acc * inv, &adam.mW2[i][j], &adam.vW2[i][j], LR);
         }
-        float accB = 0;
+        float accB = 0.0f;
         for (int w = 0; w < liczbaWatkow; w++) accB += gradientyWatkow[w].gb2[i];
-        for (int j = 0; j < UKRYTA1; j++)
-            adamUpdate(&siec.W2[i][j], &(float){accW[j] * inv},
-                       &adam.mW2[i][j], &adam.vW2[i][j], LR);
-        adamUpdate(&siec.b2[i], &(float){accB * inv},
-                   &adam.mb2[i], &adam.vb2[i], LR);
+        adamUpdate(&siec.b2[i], accB * inv, &adam.mb2[i], &adam.vb2[i], LR);
     }
     for (int i = 0; i < WYJSCIA; i++) {
-        float accW[UKRYTA2];
         for (int j = 0; j < UKRYTA2; j++) {
-            accW[j] = 0;
-            for (int w = 0; w < liczbaWatkow; w++) accW[j] += gradientyWatkow[w].gW3[i][j];
+            float acc = 0.0f;
+            for (int w = 0; w < liczbaWatkow; w++) acc += gradientyWatkow[w].gW3[i][j];
+            adamUpdate(&siec.W3[i][j], acc * inv, &adam.mW3[i][j], &adam.vW3[i][j], LR);
         }
-        float accB = 0;
+        float accB = 0.0f;
         for (int w = 0; w < liczbaWatkow; w++) accB += gradientyWatkow[w].gb3[i];
-        for (int j = 0; j < UKRYTA2; j++)
-            adamUpdate(&siec.W3[i][j], &(float){accW[j] * inv},
-                       &adam.mW3[i][j], &adam.vW3[i][j], LR);
-        adamUpdate(&siec.b3[i], &(float){accB * inv},
-                   &adam.mb3[i], &adam.vb3[i], LR);
+        adamUpdate(&siec.b3[i], accB * inv, &adam.mb3[i], &adam.vb3[i], LR);
     }
 
     LeaveCriticalSection(&csSiec);
@@ -451,15 +460,40 @@ static void pobierzStan(float *s) {
     int hx = waz.cialo[0].x, hy = waz.cialo[0].y;
     int dxF = kierDoDx(k), dyF = kierDoDy(k);
     int kR = (k + 1) % 4, kL = (k + 3) % 4;
+    int dxR = kierDoDx(kR), dyR = kierDoDy(kR);
     memset(s, 0, sizeof(float) * WEJSCIA);
+
+    // 0-2: niebezpieczenstwo (przod, prawo, lewo)
     s[0] = czySmierc(hx + dxF, hy + dyF) ? 1.0f : 0.0f;
-    s[1] = czySmierc(hx + kierDoDx(kR), hy + kierDoDy(kR)) ? 1.0f : 0.0f;
+    s[1] = czySmierc(hx + dxR, hy + dyR) ? 1.0f : 0.0f;
     s[2] = czySmierc(hx + kierDoDx(kL), hy + kierDoDy(kL)) ? 1.0f : 0.0f;
+
+    // 3-6: kierunek one-hot
     s[3 + k] = 1.0f;
-    if (jedzenie.x < hx) s[7] = 1.0f;
-    if (jedzenie.x > hx) s[8] = 1.0f;
-    if (jedzenie.y < hy) s[9] = 1.0f;
-    if (jedzenie.y > hy) s[10] = 1.0f;
+
+    // 7-8: pozycja jablka (0..1)
+    s[7] = (float)jedzenie.x / (GRID_W - 1);
+    s[8] = (float)jedzenie.y / (GRID_H - 1);
+
+    // 9-10: pozycja glowy (0..1)
+    s[9]  = (float)hx / (GRID_W - 1);
+    s[10] = (float)hy / (GRID_H - 1);
+
+    // 11-12: wektor glowa -> jablko w swiecie (-1..1)
+    int vx = jedzenie.x - hx, vy = jedzenie.y - hy;
+    s[11] = (float)vx / (GRID_W - 1);
+    s[12] = (float)vy / (GRID_H - 1);
+
+    // 13-14: jablko wzgledem glowy (os "przod" i os "prawo")
+    float fwd = (float)(vx * dxF + vy * dyF);
+    float rgt = (float)(vx * dxR + vy * dyR);
+    s[13] = fwd / (GRID_W - 1);
+    s[14] = rgt / (GRID_W - 1);
+
+    // 15-17: czy jablko jest z przodu / po prawej / po lewej
+    s[15] = (fwd > 0.0f) ? 1.0f : 0.0f;
+    s[16] = (rgt > 0.0f) ? 1.0f : 0.0f;
+    s[17] = (rgt < 0.0f) ? 1.0f : 0.0f;
 }
 
 static int wybierzAkcje(float *stan, float eps) {
@@ -682,7 +716,8 @@ static void rysujEkranTreningu(HDC hdc, float eps, double sekundy) {
     wypelnijProst(0, 70, WIN_W, 72, 0x00406080, 1.0f);
 
     rysujText(15, 12, "DQN TRENING", K_AI, 2);
-    sprintf(buf, "%d watkow (auto) | 11-128-128-3", liczbaWatkow);
+    sprintf(buf, "%d watkow | %d-%d-%d-%d", liczbaWatkow,
+            WEJSCIA, UKRYTA1, UKRYTA2, WYJSCIA);
     rysujText(15, 42, buf, K_HUD2, 1);
 
     rysujText(230, 12, "EPIZOD", K_HUD2, 1);
@@ -831,6 +866,7 @@ static void trenuj(int epizody, HDC hdc) {
 
     float eps_start = 1.0f;
     float eps_end = 0.02f;
+    float epsSpadekDo = 0.3f;   // epsilon dochodzi do minimum po 30% epizodow
     int maxKrokow = 1500;
 
     LARGE_INTEGER freq, start, teraz;
@@ -849,7 +885,7 @@ static void trenuj(int epizody, HDC hdc) {
         int punktyEp = 0;
         int kroki = 0;
 
-        float eps = eps_start + (eps_end - eps_start) * ((float)ep / epizody);
+        float eps = eps_start - (eps_start - eps_end) * ((float)ep / (epizody * epsSpadekDo));
         if (eps < eps_end) eps = eps_end;
 
         while (kroki < maxKrokow) {
@@ -876,7 +912,7 @@ static void trenuj(int epizody, HDC hdc) {
             int koniec = 0;
 
             if (!ok) {
-                nagroda = -1000.0f;
+                nagroda = NAGRODA_SMIERC;
                 memcpy(nowyStan, stan, sizeof(nowyStan));
                 koniec = 1;
             } else {
@@ -888,9 +924,9 @@ static void trenuj(int epizody, HDC hdc) {
                     waz.dlugosc++;
                     punktyEp += 10;
                     generujJedzenie();
-                    nagroda = +100.0f;
+                    nagroda = NAGRODA_JABLKO;
                 } else {
-                    nagroda = -1.0f;
+                    nagroda = NAGRODA_KROK;
                 }
                 pobierzStan(nowyStan);
             }
@@ -906,9 +942,11 @@ static void trenuj(int epizody, HDC hdc) {
             if (replayFill < REPLAY) replayFill++;
             LeaveCriticalSection(&csReplay);
 
-            if (replayFill >= BATCH) trenujBatchRownolegle();
-
             krokiGlobalne++;
+
+            // nauka: dopiero po zebraniu MIN_REPLAY probek, co UCZ_CO krokow
+            if (replayFill >= MIN_REPLAY && (krokiGlobalne % UCZ_CO) == 0)
+                trenujBatchRownolegle();
 
             // odświeżanie ekranu także w trakcie epizodu
             if ((krokiGlobalne & 63) == 0) {
